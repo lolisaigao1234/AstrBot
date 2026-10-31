@@ -619,7 +619,9 @@ async def test_query_converts_openai_tool_calls_and_results():
 
 
 @pytest.mark.asyncio
-async def test_query_drops_json_object_response_format():
+async def test_query_json_object_response_format_asks_for_json_only():
+    # Anthropic has no JSON mode; the request must still say so instead of
+    # silently losing the caller's format requirement.
     provider, captured = _capturing_provider()
 
     await provider._query(
@@ -633,6 +635,29 @@ async def test_query_drops_json_object_response_format():
 
     assert "response_format" not in captured
     assert "format" not in (captured.get("output_config") or {})
+    instruction = captured["system"][-1]["text"]
+    assert "JSON object" in instruction
+
+
+@pytest.mark.asyncio
+async def test_query_json_object_instruction_follows_lifted_system_prompt():
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [
+                {"role": "system", "content": "You are Gemini."},
+                {"role": "user", "content": "hi"},
+            ],
+            "response_format": {"type": "json_object"},
+        },
+        None,
+    )
+
+    texts = [block["text"] for block in captured["system"]]
+    assert texts[0] == "You are Gemini."
+    assert "JSON object" in texts[-1]
 
 
 @pytest.mark.asyncio
@@ -681,6 +706,65 @@ async def test_query_maps_json_schema_response_format_to_output_config():
     assert "minLength" not in schema["properties"]["decision"]
     assert "minimum" not in schema["properties"]["score"]
     assert "maximum" not in schema["properties"]["score"]
+    # Unsupported constraints are kept as hints instead of being lost.
+    assert schema["properties"]["decision"]["description"] == "{minLength: 1}"
+    assert schema["properties"]["score"]["description"] == "{minimum: 0, maximum: 5}"
+
+
+@pytest.mark.asyncio
+async def test_output_schema_keeps_descriptions_type_lists_and_small_min_items():
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "reflection",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {"type": ["string", "null"]},
+                            "confidence": {
+                                "type": "number",
+                                "description": "How sure.",
+                                "minimum": 0,
+                                "maximum": 1,
+                            },
+                            "handles": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1,
+                                "maxItems": 3,
+                            },
+                            "anniversaries": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 2,
+                            },
+                        },
+                        "required": [
+                            "item_id",
+                            "confidence",
+                            "handles",
+                            "anniversaries",
+                        ],
+                    },
+                },
+            },
+        },
+        None,
+    )
+
+    props = captured["output_config"]["format"]["schema"]["properties"]
+    assert props["item_id"] == {"type": ["string", "null"]}
+    assert props["confidence"]["description"] == "How sure.\n\n{minimum: 0, maximum: 1}"
+    assert props["handles"]["minItems"] == 1
+    assert props["handles"]["description"] == "{maxItems: 3}"
+    assert "minItems" not in props["anniversaries"]
+    assert props["anniversaries"]["description"] == "{minItems: 2}"
 
 
 @pytest.mark.asyncio

@@ -506,7 +506,10 @@ class ProviderAnthropic(Provider):
         logger.warning(f"未知的 tool_choice 值: {tool_choice}，已回退为 'auto'")
         return {"type": "auto"}
 
-    # JSON Schema keywords the Messages API structured outputs reject.
+    # JSON Schema keywords the Messages API structured outputs reject. Like the
+    # SDK's ``transform_schema``, they are kept as a description hint instead
+    # of being dropped (that helper is not used directly: it needs a newer SDK
+    # than AstrBot's floor and rejects ``"type": [..., "null"]`` unions).
     _UNSUPPORTED_OUTPUT_SCHEMA_KEYS = frozenset(
         {
             "minimum",
@@ -524,6 +527,24 @@ class ProviderAnthropic(Provider):
             "maxProperties",
         }
     )
+    _SUPPORTED_STRING_FORMATS = frozenset(
+        {
+            "date-time",
+            "time",
+            "date",
+            "duration",
+            "email",
+            "hostname",
+            "uri",
+            "ipv4",
+            "ipv6",
+            "uuid",
+        }
+    )
+    _JSON_OBJECT_INSTRUCTION = (
+        "Respond with a single valid JSON object only: no prose before or after "
+        "it and no Markdown code fences."
+    )
 
     @classmethod
     def _anthropic_output_schema(cls, schema: Any) -> Any:
@@ -533,10 +554,16 @@ class ProviderAnthropic(Provider):
         if not isinstance(schema, dict):
             return schema
         adapted = {}
+        hints = {}
         for key, value in schema.items():
             if key in cls._UNSUPPORTED_OUTPUT_SCHEMA_KEYS:
-                continue
-            if key in ("properties", "$defs", "definitions") and isinstance(
+                if key == "minItems" and value in (0, 1):
+                    adapted[key] = value
+                else:
+                    hints[key] = value
+            elif key == "format" and value not in cls._SUPPORTED_STRING_FORMATS:
+                hints[key] = value
+            elif key in ("properties", "$defs", "definitions") and isinstance(
                 value, dict
             ):
                 adapted[key] = {
@@ -547,6 +574,16 @@ class ProviderAnthropic(Provider):
                 adapted[key] = cls._anthropic_output_schema(value)
         if adapted.get("type") == "object" or "properties" in adapted:
             adapted["additionalProperties"] = False
+        if hints:
+            hint = (
+                "{" + ", ".join(f"{key}: {value}" for key, value in hints.items()) + "}"
+            )
+            description = adapted.get("description")
+            adapted["description"] = (
+                f"{description}\n\n{hint}"
+                if isinstance(description, str) and description
+                else hint
+            )
         return adapted
 
     @staticmethod
@@ -586,10 +623,10 @@ class ProviderAnthropic(Provider):
         ``response_format``; the Messages API rejects all of these.
         """
         response_format = payloads.pop("response_format", None)
-        if (
-            isinstance(response_format, dict)
-            and response_format.get("type") == "json_schema"
-        ):
+        format_type = (
+            response_format.get("type") if isinstance(response_format, dict) else None
+        )
+        if format_type == "json_schema":
             spec = response_format.get("json_schema") or {}
             schema = spec.get("schema") if isinstance(spec, dict) else None
             if isinstance(schema, dict):
@@ -601,8 +638,13 @@ class ProviderAnthropic(Provider):
                 payloads["output_config"] = output_config
 
         messages = payloads.get("messages")
-        if not isinstance(messages, list) or not self._is_openai_shaped(messages):
-            return
+        if isinstance(messages, list) and self._is_openai_shaped(messages):
+            self._lift_openai_messages(payloads, messages)
+        if format_type == "json_object":
+            # Anthropic has no JSON mode; ask for it instead of dropping it.
+            self._append_system_text(payloads, self._JSON_OBJECT_INSTRUCTION)
+
+    def _lift_openai_messages(self, payloads: dict, messages: list) -> None:
         system_texts = []
         conversation = []
         for message in messages:
@@ -614,14 +656,18 @@ class ProviderAnthropic(Provider):
                 conversation.append(message)
         _, payloads["messages"] = self._prepare_payload(conversation)
         if system_texts:
-            block = {"type": "text", "text": "\n\n".join(system_texts)}
-            existing = payloads.get("system")
-            if isinstance(existing, str) and existing.strip():
-                payloads["system"] = [{"type": "text", "text": existing}, block]
-            elif isinstance(existing, list) and existing:
-                payloads["system"] = [*existing, block]
-            else:
-                payloads["system"] = [block]
+            self._append_system_text(payloads, "\n\n".join(system_texts))
+
+    @staticmethod
+    def _append_system_text(payloads: dict, text: str) -> None:
+        block = {"type": "text", "text": text}
+        existing = payloads.get("system")
+        if isinstance(existing, str) and existing.strip():
+            payloads["system"] = [{"type": "text", "text": existing}, block]
+        elif isinstance(existing, list) and existing:
+            payloads["system"] = [*existing, block]
+        else:
+            payloads["system"] = [block]
 
     @classmethod
     def _apply_explicit_prompt_cache_breakpoints(cls, payloads: dict) -> None:
