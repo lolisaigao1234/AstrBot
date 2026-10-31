@@ -787,3 +787,142 @@ async def test_query_leaves_anthropic_shaped_payload_untouched():
 
     assert captured["messages"] == messages
     assert [block["text"] for block in captured["system"]] == ["base"]
+
+
+@pytest.mark.asyncio
+async def test_query_treats_developer_role_as_system():
+    # Current OpenAI SDKs emit "developer" where older ones used "system".
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [
+                {"role": "developer", "content": "You are Gemini."},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+        None,
+    )
+
+    assert [m["role"] for m in captured["messages"]] == ["user"]
+    assert [block["text"] for block in captured["system"]] == ["You are Gemini."]
+
+
+@pytest.mark.asyncio
+async def test_open_map_schema_falls_back_to_a_json_instruction():
+    # Structured outputs require additionalProperties: false everywhere, so a
+    # free-form map could only ever decode to {}; ask in the prompt instead.
+    provider, captured = _capturing_provider()
+    schema = {
+        "type": "object",
+        "properties": {
+            "tags": {"type": "object", "additionalProperties": {"type": "string"}}
+        },
+        "required": ["tags"],
+    }
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "tagged", "schema": schema},
+            },
+        },
+        None,
+    )
+
+    assert "format" not in (captured.get("output_config") or {})
+    instruction = captured["system"][-1]["text"]
+    assert "JSON object" in instruction
+    assert json.dumps(schema, ensure_ascii=False) in instruction
+
+
+@pytest.mark.asyncio
+async def test_output_schema_leaves_literal_values_untouched():
+    provider, captured = _capturing_provider()
+    literal = {"pattern": "a*", "maxLength": 3, "properties": {"x": {}}}
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "literal",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "choice": {
+                                "type": "object",
+                                "properties": {"pattern": {"type": "string"}},
+                                "enum": [literal],
+                                "default": literal,
+                                "examples": [literal],
+                            }
+                        },
+                        "required": ["choice"],
+                    },
+                },
+            },
+        },
+        None,
+    )
+
+    choice = captured["output_config"]["format"]["schema"]["properties"]["choice"]
+    assert choice["enum"] == [literal]
+    assert choice["default"] == literal
+    assert choice["examples"] == [literal]
+    assert choice["properties"]["pattern"] == {"type": "string"}
+
+
+@pytest.mark.asyncio
+async def test_query_stream_normalizes_openai_payload(monkeypatch):
+    sent: dict[str, object] = {}
+
+    def handle(request):
+        sent.update(json.loads(request.content))
+        return sdk_httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_tool_use_stream(["{}"]),
+        )
+
+    transport = sdk_httpx.MockTransport(handle)
+    monkeypatch.setattr(
+        ProviderAnthropic,
+        "_create_http_client",
+        lambda self, provider_config: sdk_httpx.AsyncClient(transport=transport),
+    )
+    provider = ProviderAnthropic(
+        {
+            "id": "test",
+            "type": "anthropic_chat_completion",
+            "key": ["sk-test"],
+            "model": "claude-test",
+            "api_base": "https://api.anthropic.test",
+        },
+        {},
+    )
+    payloads = {
+        "model": "claude-test",
+        "messages": [
+            {"role": "system", "content": "You are Gemini."},
+            {"role": "user", "content": "hi"},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        [r async for r in provider._query_stream(payloads, None)]
+    finally:
+        await provider.terminate()
+
+    assert [m["role"] for m in sent["messages"]] == ["user"]
+    assert "response_format" not in sent
+    texts = [block["text"] for block in sent["system"]]
+    assert texts[0] == "You are Gemini."
+    assert "JSON object" in texts[-1]

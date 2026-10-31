@@ -546,11 +546,25 @@ class ProviderAnthropic(Provider):
         "it and no Markdown code fences."
     )
 
+    # Keywords whose values are themselves schemas; everything else (enum,
+    # const, default, examples, ...) is a literal and is copied verbatim.
+    _SUBSCHEMA_KEYS = frozenset({"items", "not", "contains", "propertyNames"})
+    _SUBSCHEMA_LIST_KEYS = frozenset({"anyOf", "allOf", "oneOf", "prefixItems"})
+    _SUBSCHEMA_MAP_KEYS = frozenset(
+        {"properties", "$defs", "definitions", "patternProperties"}
+    )
+
+    class _OpenObjectSchema(ValueError):
+        """Structured outputs cannot express an object with open properties."""
+
     @classmethod
     def _anthropic_output_schema(cls, schema: Any) -> Any:
-        """Adapt an OpenAI json_schema to the structured-outputs subset."""
-        if isinstance(schema, list):
-            return [cls._anthropic_output_schema(item) for item in schema]
+        """Adapt an OpenAI json_schema to the structured-outputs subset.
+
+        Raises ``_OpenObjectSchema`` for free-form maps: structured outputs
+        require ``additionalProperties: false`` on every object, which would
+        force such a map to decode as ``{}``.
+        """
         if not isinstance(schema, dict):
             return schema
         adapted = {}
@@ -563,15 +577,20 @@ class ProviderAnthropic(Provider):
                     hints[key] = value
             elif key == "format" and value not in cls._SUPPORTED_STRING_FORMATS:
                 hints[key] = value
-            elif key in ("properties", "$defs", "definitions") and isinstance(
-                value, dict
-            ):
+            elif key == "additionalProperties":
+                if value is not False:
+                    raise cls._OpenObjectSchema(key)
+            elif key in cls._SUBSCHEMA_MAP_KEYS and isinstance(value, dict):
                 adapted[key] = {
                     name: cls._anthropic_output_schema(item)
                     for name, item in value.items()
                 }
-            else:
+            elif key in cls._SUBSCHEMA_LIST_KEYS and isinstance(value, list):
+                adapted[key] = [cls._anthropic_output_schema(item) for item in value]
+            elif key in cls._SUBSCHEMA_KEYS:
                 adapted[key] = cls._anthropic_output_schema(value)
+            else:
+                adapted[key] = value
         if adapted.get("type") == "object" or "properties" in adapted:
             adapted["additionalProperties"] = False
         if hints:
@@ -591,7 +610,9 @@ class ProviderAnthropic(Provider):
         for message in messages:
             if not isinstance(message, dict):
                 continue
-            if message.get("role") in ("system", "tool") or message.get("tool_calls"):
+            if message.get("role") in ("system", "developer", "tool") or message.get(
+                "tool_calls"
+            ):
                 return True
             content = message.get("content")
             if isinstance(content, list) and any(
@@ -626,29 +647,40 @@ class ProviderAnthropic(Provider):
         format_type = (
             response_format.get("type") if isinstance(response_format, dict) else None
         )
+        instruction = None
         if format_type == "json_schema":
             spec = response_format.get("json_schema") or {}
             schema = spec.get("schema") if isinstance(spec, dict) else None
             if isinstance(schema, dict):
-                output_config = dict(payloads.get("output_config") or {})
-                output_config["format"] = {
-                    "type": "json_schema",
-                    "schema": self._anthropic_output_schema(schema),
-                }
-                payloads["output_config"] = output_config
+                try:
+                    adapted = self._anthropic_output_schema(schema)
+                except self._OpenObjectSchema:
+                    instruction = (
+                        f"{self._JSON_OBJECT_INSTRUCTION} It must match this JSON "
+                        f"Schema:\n{json.dumps(schema, ensure_ascii=False)}"
+                    )
+                else:
+                    output_config = dict(payloads.get("output_config") or {})
+                    output_config["format"] = {"type": "json_schema", "schema": adapted}
+                    payloads["output_config"] = output_config
+        elif format_type == "json_object":
+            # Anthropic has no JSON mode; ask for it instead of dropping it.
+            instruction = self._JSON_OBJECT_INSTRUCTION
 
         messages = payloads.get("messages")
         if isinstance(messages, list) and self._is_openai_shaped(messages):
             self._lift_openai_messages(payloads, messages)
-        if format_type == "json_object":
-            # Anthropic has no JSON mode; ask for it instead of dropping it.
-            self._append_system_text(payloads, self._JSON_OBJECT_INSTRUCTION)
+        if instruction:
+            self._append_system_text(payloads, instruction)
 
     def _lift_openai_messages(self, payloads: dict, messages: list) -> None:
         system_texts = []
         conversation = []
         for message in messages:
-            if isinstance(message, dict) and message.get("role") == "system":
+            if isinstance(message, dict) and message.get("role") in (
+                "system",
+                "developer",
+            ):
                 text = self._system_text(message.get("content"))
                 if text:
                     system_texts.append(text)
