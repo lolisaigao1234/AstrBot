@@ -505,3 +505,424 @@ async def test_malformed_custom_tools_reach_api_validation(
     assert captured[0]["tools"][0]["name"] == "get_time"
     assert captured[0]["tools"][1:] == custom_tools
     assert provider.provider_config["custom_extra_body"]["tools"] == custom_tools
+
+
+def _capturing_provider(extra_config=None):
+    provider = ProviderAnthropic(
+        provider_config={
+            "id": "anthropic-test",
+            "type": "anthropic_chat_completion",
+            "model": "claude-test",
+            "key": ["test-key"],
+            **(extra_config or {}),
+        },
+        provider_settings={},
+    )
+    captured: dict[str, object] = {}
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return Message(
+                id="msg_1",
+                content=[TextBlock(text="ok", type="text")],
+                model="claude-test",
+                role="assistant",
+                stop_reason="end_turn",
+                stop_sequence=None,
+                type="message",
+                usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+    provider.client = SimpleNamespace(messages=FakeMessages())
+    return provider, captured
+
+
+@pytest.mark.asyncio
+async def test_query_lifts_openai_system_messages_into_system_param():
+    # Callers such as plugins hand `_query` an OpenAI-shaped payload directly;
+    # the Messages API rejects a leading system-role message.
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [
+                {"role": "system", "content": "You are Gemini."},
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "Reply in JSON."}],
+                },
+                {"role": "user", "content": "hi"},
+            ],
+        },
+        None,
+    )
+
+    assert [m["role"] for m in captured["messages"]] == ["user"]
+    texts = [block["text"] for block in captured["system"]]
+    assert texts == ["You are Gemini.\n\nReply in JSON."]
+
+
+@pytest.mark.asyncio
+async def test_query_appends_lifted_system_after_existing_system_blocks():
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "system": [{"type": "text", "text": "base"}],
+            "messages": [
+                {"role": "system", "content": "extra"},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+        None,
+    )
+
+    assert [block["text"] for block in captured["system"]] == ["base", "extra"]
+
+
+@pytest.mark.asyncio
+async def test_query_converts_openai_tool_calls_and_results():
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "what time is it"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_time", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "12:00"},
+            ],
+        },
+        None,
+    )
+
+    assistant, result = captured["messages"][1], captured["messages"][2]
+    assert assistant["content"][0]["type"] == "tool_use"
+    assert assistant["content"][0]["id"] == "call_1"
+    assert result["role"] == "user"
+    assert result["content"][0]["type"] == "tool_result"
+    assert result["content"][0]["tool_use_id"] == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_query_json_object_response_format_asks_for_json_only():
+    # Anthropic has no JSON mode; the request must still say so instead of
+    # silently losing the caller's format requirement.
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+        },
+        None,
+    )
+
+    assert "response_format" not in captured
+    assert "format" not in (captured.get("output_config") or {})
+    instruction = captured["system"][-1]["text"]
+    assert "JSON object" in instruction
+
+
+@pytest.mark.asyncio
+async def test_query_json_object_instruction_follows_lifted_system_prompt():
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [
+                {"role": "system", "content": "You are Gemini."},
+                {"role": "user", "content": "hi"},
+            ],
+            "response_format": {"type": "json_object"},
+        },
+        None,
+    )
+
+    texts = [block["text"] for block in captured["system"]]
+    assert texts[0] == "You are Gemini."
+    assert "JSON object" in texts[-1]
+
+
+@pytest.mark.asyncio
+async def test_query_maps_json_schema_response_format_to_output_config():
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "low"},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "verdict",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "decision": {"type": "string", "minLength": 1},
+                            "score": {"type": "integer", "minimum": 0, "maximum": 5},
+                            "tags": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"t": {"type": "string"}},
+                                },
+                            },
+                        },
+                        "required": ["decision"],
+                    },
+                },
+            },
+        },
+        None,
+    )
+
+    assert "response_format" not in captured
+    output_config = captured["output_config"]
+    assert output_config["effort"] == "low"
+    fmt = output_config["format"]
+    assert fmt["type"] == "json_schema"
+    schema = fmt["schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["tags"]["items"]["additionalProperties"] is False
+    assert "minLength" not in schema["properties"]["decision"]
+    assert "minimum" not in schema["properties"]["score"]
+    assert "maximum" not in schema["properties"]["score"]
+    # Unsupported constraints are kept as hints instead of being lost.
+    assert schema["properties"]["decision"]["description"] == "{minLength: 1}"
+    assert schema["properties"]["score"]["description"] == "{minimum: 0, maximum: 5}"
+
+
+@pytest.mark.asyncio
+async def test_output_schema_keeps_descriptions_type_lists_and_small_min_items():
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "reflection",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {"type": ["string", "null"]},
+                            "confidence": {
+                                "type": "number",
+                                "description": "How sure.",
+                                "minimum": 0,
+                                "maximum": 1,
+                            },
+                            "handles": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1,
+                                "maxItems": 3,
+                            },
+                            "anniversaries": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 2,
+                            },
+                        },
+                        "required": [
+                            "item_id",
+                            "confidence",
+                            "handles",
+                            "anniversaries",
+                        ],
+                    },
+                },
+            },
+        },
+        None,
+    )
+
+    props = captured["output_config"]["format"]["schema"]["properties"]
+    assert props["item_id"] == {"type": ["string", "null"]}
+    assert props["confidence"]["description"] == "How sure.\n\n{minimum: 0, maximum: 1}"
+    assert props["handles"]["minItems"] == 1
+    assert props["handles"]["description"] == "{maxItems: 3}"
+    assert "minItems" not in props["anniversaries"]
+    assert props["anniversaries"]["description"] == "{minItems: 2}"
+
+
+@pytest.mark.asyncio
+async def test_query_leaves_anthropic_shaped_payload_untouched():
+    provider, captured = _capturing_provider()
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        {"role": "user", "content": "again"},
+    ]
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "system": [{"type": "text", "text": "base"}],
+            "messages": [dict(m) for m in messages],
+        },
+        None,
+    )
+
+    assert captured["messages"] == messages
+    assert [block["text"] for block in captured["system"]] == ["base"]
+
+
+@pytest.mark.asyncio
+async def test_query_treats_developer_role_as_system():
+    # Current OpenAI SDKs emit "developer" where older ones used "system".
+    provider, captured = _capturing_provider()
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [
+                {"role": "developer", "content": "You are Gemini."},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+        None,
+    )
+
+    assert [m["role"] for m in captured["messages"]] == ["user"]
+    assert [block["text"] for block in captured["system"]] == ["You are Gemini."]
+
+
+@pytest.mark.asyncio
+async def test_open_map_schema_falls_back_to_a_json_instruction():
+    # Structured outputs require additionalProperties: false everywhere, so a
+    # free-form map could only ever decode to {}; ask in the prompt instead.
+    provider, captured = _capturing_provider()
+    schema = {
+        "type": "object",
+        "properties": {
+            "tags": {"type": "object", "additionalProperties": {"type": "string"}}
+        },
+        "required": ["tags"],
+    }
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "tagged", "schema": schema},
+            },
+        },
+        None,
+    )
+
+    assert "format" not in (captured.get("output_config") or {})
+    instruction = captured["system"][-1]["text"]
+    assert "JSON object" in instruction
+    assert json.dumps(schema, ensure_ascii=False) in instruction
+
+
+@pytest.mark.asyncio
+async def test_output_schema_leaves_literal_values_untouched():
+    provider, captured = _capturing_provider()
+    literal = {"pattern": "a*", "maxLength": 3, "properties": {"x": {}}}
+
+    await provider._query(
+        {
+            "model": "claude-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "literal",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "choice": {
+                                "type": "object",
+                                "properties": {"pattern": {"type": "string"}},
+                                "enum": [literal],
+                                "default": literal,
+                                "examples": [literal],
+                            }
+                        },
+                        "required": ["choice"],
+                    },
+                },
+            },
+        },
+        None,
+    )
+
+    choice = captured["output_config"]["format"]["schema"]["properties"]["choice"]
+    assert choice["enum"] == [literal]
+    assert choice["default"] == literal
+    assert choice["examples"] == [literal]
+    assert choice["properties"]["pattern"] == {"type": "string"}
+
+
+@pytest.mark.asyncio
+async def test_query_stream_normalizes_openai_payload(monkeypatch):
+    sent: dict[str, object] = {}
+
+    def handle(request):
+        sent.update(json.loads(request.content))
+        return sdk_httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_tool_use_stream(["{}"]),
+        )
+
+    transport = sdk_httpx.MockTransport(handle)
+    monkeypatch.setattr(
+        ProviderAnthropic,
+        "_create_http_client",
+        lambda self, provider_config: sdk_httpx.AsyncClient(transport=transport),
+    )
+    provider = ProviderAnthropic(
+        {
+            "id": "test",
+            "type": "anthropic_chat_completion",
+            "key": ["sk-test"],
+            "model": "claude-test",
+            "api_base": "https://api.anthropic.test",
+        },
+        {},
+    )
+    payloads = {
+        "model": "claude-test",
+        "messages": [
+            {"role": "system", "content": "You are Gemini."},
+            {"role": "user", "content": "hi"},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        [r async for r in provider._query_stream(payloads, None)]
+    finally:
+        await provider.terminate()
+
+    assert [m["role"] for m in sent["messages"]] == ["user"]
+    assert "response_format" not in sent
+    texts = [block["text"] for block in sent["system"]]
+    assert texts[0] == "You are Gemini."
+    assert "JSON object" in texts[-1]

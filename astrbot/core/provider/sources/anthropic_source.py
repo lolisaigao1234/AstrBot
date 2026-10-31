@@ -506,6 +506,201 @@ class ProviderAnthropic(Provider):
         logger.warning(f"未知的 tool_choice 值: {tool_choice}，已回退为 'auto'")
         return {"type": "auto"}
 
+    # JSON Schema keywords the Messages API structured outputs reject. Like the
+    # SDK's ``transform_schema``, they are kept as a description hint instead
+    # of being dropped (that helper is not used directly: it needs a newer SDK
+    # than AstrBot's floor and rejects ``"type": [..., "null"]`` unions).
+    _UNSUPPORTED_OUTPUT_SCHEMA_KEYS = frozenset(
+        {
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+            "minLength",
+            "maxLength",
+            "pattern",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
+            "minProperties",
+            "maxProperties",
+        }
+    )
+    _SUPPORTED_STRING_FORMATS = frozenset(
+        {
+            "date-time",
+            "time",
+            "date",
+            "duration",
+            "email",
+            "hostname",
+            "uri",
+            "ipv4",
+            "ipv6",
+            "uuid",
+        }
+    )
+    _JSON_OBJECT_INSTRUCTION = (
+        "Respond with a single valid JSON object only: no prose before or after "
+        "it and no Markdown code fences."
+    )
+
+    # Keywords whose values are themselves schemas; everything else (enum,
+    # const, default, examples, ...) is a literal and is copied verbatim.
+    _SUBSCHEMA_KEYS = frozenset({"items", "not", "contains", "propertyNames"})
+    _SUBSCHEMA_LIST_KEYS = frozenset({"anyOf", "allOf", "oneOf", "prefixItems"})
+    _SUBSCHEMA_MAP_KEYS = frozenset(
+        {"properties", "$defs", "definitions", "patternProperties"}
+    )
+
+    class _OpenObjectSchema(ValueError):
+        """Structured outputs cannot express an object with open properties."""
+
+    @classmethod
+    def _anthropic_output_schema(cls, schema: Any) -> Any:
+        """Adapt an OpenAI json_schema to the structured-outputs subset.
+
+        Raises ``_OpenObjectSchema`` for free-form maps: structured outputs
+        require ``additionalProperties: false`` on every object, which would
+        force such a map to decode as ``{}``.
+        """
+        if not isinstance(schema, dict):
+            return schema
+        adapted = {}
+        hints = {}
+        for key, value in schema.items():
+            if key in cls._UNSUPPORTED_OUTPUT_SCHEMA_KEYS:
+                if key == "minItems" and value in (0, 1):
+                    adapted[key] = value
+                else:
+                    hints[key] = value
+            elif key == "format" and value not in cls._SUPPORTED_STRING_FORMATS:
+                hints[key] = value
+            elif key == "additionalProperties":
+                if value is not False:
+                    raise cls._OpenObjectSchema(key)
+            elif key in cls._SUBSCHEMA_MAP_KEYS and isinstance(value, dict):
+                adapted[key] = {
+                    name: cls._anthropic_output_schema(item)
+                    for name, item in value.items()
+                }
+            elif key in cls._SUBSCHEMA_LIST_KEYS and isinstance(value, list):
+                adapted[key] = [cls._anthropic_output_schema(item) for item in value]
+            elif key in cls._SUBSCHEMA_KEYS:
+                adapted[key] = cls._anthropic_output_schema(value)
+            else:
+                adapted[key] = value
+        if adapted.get("type") == "object" or "properties" in adapted:
+            adapted["additionalProperties"] = False
+        if hints:
+            hint = (
+                "{" + ", ".join(f"{key}: {value}" for key, value in hints.items()) + "}"
+            )
+            description = adapted.get("description")
+            adapted["description"] = (
+                f"{description}\n\n{hint}"
+                if isinstance(description, str) and description
+                else hint
+            )
+        return adapted
+
+    @staticmethod
+    def _is_openai_shaped(messages: list) -> bool:
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") in ("system", "developer", "tool") or message.get(
+                "tool_calls"
+            ):
+                return True
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                isinstance(part, dict)
+                and part.get("type") in ("image_url", "audio_url", "think")
+                for part in content
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _system_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            return "\n".join(
+                str(part.get("text", "")).strip()
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ).strip()
+        return ""
+
+    def _normalize_openai_payload(self, payloads: dict) -> None:
+        """Accept OpenAI-shaped payloads handed straight to ``_query``.
+
+        ``text_chat`` converts messages with ``_prepare_payload`` first, but
+        callers such as plugins call ``_query`` with OpenAI chat messages
+        (system/tool roles, ``tool_calls``, ``image_url`` parts) and an OpenAI
+        ``response_format``; the Messages API rejects all of these.
+        """
+        response_format = payloads.pop("response_format", None)
+        format_type = (
+            response_format.get("type") if isinstance(response_format, dict) else None
+        )
+        instruction = None
+        if format_type == "json_schema":
+            spec = response_format.get("json_schema") or {}
+            schema = spec.get("schema") if isinstance(spec, dict) else None
+            if isinstance(schema, dict):
+                try:
+                    adapted = self._anthropic_output_schema(schema)
+                except self._OpenObjectSchema:
+                    instruction = (
+                        f"{self._JSON_OBJECT_INSTRUCTION} It must match this JSON "
+                        f"Schema:\n{json.dumps(schema, ensure_ascii=False)}"
+                    )
+                else:
+                    output_config = dict(payloads.get("output_config") or {})
+                    output_config["format"] = {"type": "json_schema", "schema": adapted}
+                    payloads["output_config"] = output_config
+        elif format_type == "json_object":
+            # Anthropic has no JSON mode; ask for it instead of dropping it.
+            instruction = self._JSON_OBJECT_INSTRUCTION
+
+        messages = payloads.get("messages")
+        if isinstance(messages, list) and self._is_openai_shaped(messages):
+            self._lift_openai_messages(payloads, messages)
+        if instruction:
+            self._append_system_text(payloads, instruction)
+
+    def _lift_openai_messages(self, payloads: dict, messages: list) -> None:
+        system_texts = []
+        conversation = []
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") in (
+                "system",
+                "developer",
+            ):
+                text = self._system_text(message.get("content"))
+                if text:
+                    system_texts.append(text)
+            else:
+                conversation.append(message)
+        _, payloads["messages"] = self._prepare_payload(conversation)
+        if system_texts:
+            self._append_system_text(payloads, "\n\n".join(system_texts))
+
+    @staticmethod
+    def _append_system_text(payloads: dict, text: str) -> None:
+        block = {"type": "text", "text": text}
+        existing = payloads.get("system")
+        if isinstance(existing, str) and existing.strip():
+            payloads["system"] = [{"type": "text", "text": existing}, block]
+        elif isinstance(existing, list) and existing:
+            payloads["system"] = [*existing, block]
+        else:
+            payloads["system"] = [block]
+
     @classmethod
     def _apply_explicit_prompt_cache_breakpoints(cls, payloads: dict) -> None:
         system_blocks = payloads.get("system")
@@ -524,6 +719,7 @@ class ProviderAnthropic(Provider):
         request_max_retries: int | None = None,
         conversation_id: str | None = None,
     ) -> LLMResponse:
+        self._normalize_openai_payload(payloads)
         if tools:
             if tool_list := tools.get_func_desc_anthropic_style():
                 payloads["tools"] = tool_list
@@ -639,6 +835,7 @@ class ProviderAnthropic(Provider):
         request_max_retries: int | None = None,
         conversation_id: str | None = None,
     ) -> AsyncGenerator[LLMResponse, None]:
+        self._normalize_openai_payload(payloads)
         if tools:
             if tool_list := tools.get_func_desc_anthropic_style():
                 payloads["tools"] = tool_list
